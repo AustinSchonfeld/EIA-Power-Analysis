@@ -35,7 +35,7 @@ def get_data(route, params):
             "length": PAGE_SIZE,
             **params
         }
-        response = requests.get(url, params=query, timeout=10)
+        response = requests.get(url, params=query, timeout=30) #TIMEOUT ERROR NEEDS FIXING. BREAK REQUESTS INTO SMALLER CHUNKS ONE FUEL TYPE AT A TIME.
         response.raise_for_status()
         payload = response.json()["response"]
 
@@ -55,17 +55,26 @@ def load_staging(records, batch_id):
         [(batch_id, json.dumps(rec)) for rec in records],
     )
 
+FUEL_TYPES = ["SUN"]
+#"WAT", "NG", "NUC", "OIL", "COL", "GEO", "SNB", "WNB", "BAT"
+
+#EIA parameters for what data to pull and how to sort the pages. Sorting by time period AND fueltype is important to ensure data isn't skipped for identical time periods.
+#This project only filters for California energy data "CAL" to keep the database from getting too large
 params = {
     "frequency": "hourly",
     "data[0]": "value",
-    "facets[fueltype][]": "SUN",
+    "facets[fueltype][]": FUEL_TYPES,
     "facets[respondent][]":"CAL",
     "start": "2026-01-01",
-    "end": "2026-11-10",
+    "end": "2026-02-01",
     "sort[0][column]": "period",
-    "sort[0][direction]": "desc"
+    "sort[0][direction]": "desc",
+    "sort[1][column]": "fueltype",
+    "sort[1][direction]": "asc"
 }
 
+#SQL Query string to update the target database with the most recent data without creating duplicate rows. 
+#Data is loading into the staging database in JSON format and then interpreted into usable rows and columns 
 MERGE_SQL = """
 MERGE dbo.eia_hourly_generation_bytype AS t
 USING (
@@ -119,6 +128,7 @@ VALUES
     (s.period, s.respondent, s.respondent_name, s.fueltype, s.fuel_name, s.value, s.value_units);
 """
 
+# Main function that makes the API call, loads the JSON data into a staging database, and then runs a SQL query to sort the raw JSON data into the target table
 if __name__ == "__main__":
     batch_id = str(uuid.uuid4())
     try:
