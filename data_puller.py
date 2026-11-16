@@ -3,11 +3,14 @@ import requests
 import json
 import pyodbc
 import uuid
+from datetime import date, timedelta
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 API_KEY = os.environ["EIA_API_KEY"]
 BASE = "https://api.eia.gov/v2"
 ROUTE = "electricity/rto/fuel-type-data/data/"
-PAGE_SIZE = 5000
+PAGE_SIZE = 2000
 
 #connection info and credentials for SQL authentication
 conn = pyodbc.connect(
@@ -22,6 +25,16 @@ conn = pyodbc.connect(
 cur = conn.cursor()
 cur.fast_executemany = True #speedup bulk additions to the database
 
+#establish an HTTPS session with automatic retries 
+session = requests.Session()
+session.mount("https://", HTTPAdapter(max_retries=Retry(
+    total=5,
+    backoff_factor=2,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"],
+    respect_retry_after_header=True,
+)))
+
 def get_data(route, params):
     """Fetch every page of data from the EIA API for a given route and parameters."""
     url = f"{BASE}/{route}"
@@ -35,7 +48,7 @@ def get_data(route, params):
             "length": PAGE_SIZE,
             **params
         }
-        response = requests.get(url, params=query, timeout=30) #TIMEOUT ERROR NEEDS FIXING. BREAK REQUESTS INTO SMALLER CHUNKS ONE FUEL TYPE AT A TIME.
+        response = requests.get(url, params=query, timeout=(10, 60)) #10s to connect, 60s to read 
         response.raise_for_status()
         payload = response.json()["response"]
 
@@ -44,10 +57,17 @@ def get_data(route, params):
 
         total = int(payload["total"])
         offset += PAGE_SIZE
-        if offset >= total or not batch:
+        if offset >= int(payload["total"]) or not batch:
             break
 
     return all_data
+
+def month_windows(start,end):
+    cur = start
+    while cur <= end:
+        nxt = (cur.replace(day=28) + timedelta(days=4)).replace(day=1) #finds the first day of the next month without needing to know how long the current month is
+        yield cur, min(nxt - timedelta(days=1), end)
+        cur = nxt
 
 def load_staging(records, batch_id):
     cur.executemany(
@@ -55,22 +75,17 @@ def load_staging(records, batch_id):
         [(batch_id, json.dumps(rec)) for rec in records],
     )
 
-FUEL_TYPES = ["SUN"]
-#"WAT", "NG", "NUC", "OIL", "COL", "GEO", "SNB", "WNB", "BAT"
+#Fuel types are defined independent from the parameters dictionary in order to chunk API calls to one fuel at a time
+FUEL_TYPES = ["SUN", "WAT", "NG", "NUC", "OIL", "COL", "GEO", "SNB", "WNB", "BAT"]
 
-#EIA parameters for what data to pull and how to sort the pages. Sorting by time period AND fueltype is important to ensure data isn't skipped for identical time periods.
+#EIA parameters for what data to pull and how to sort the pages. 
 #This project only filters for California energy data "CAL" to keep the database from getting too large
-params = {
+base_params = {
     "frequency": "hourly",
     "data[0]": "value",
-    "facets[fueltype][]": FUEL_TYPES,
     "facets[respondent][]":"CAL",
-    "start": "2026-01-01",
-    "end": "2026-02-01",
     "sort[0][column]": "period",
     "sort[0][direction]": "desc",
-    "sort[1][column]": "fueltype",
-    "sort[1][direction]": "asc"
 }
 
 #SQL Query string to update the target database with the most recent data without creating duplicate rows. 
@@ -132,10 +147,23 @@ VALUES
 if __name__ == "__main__":
     batch_id = str(uuid.uuid4())
     try:
-        records = get_data(ROUTE, params)
-        print(f"Fetched {len(records)} records")
+        total = 0
+        for start, end in month_windows(date(2026, 1, 1), date.today()): #grabs all data from the start of 2026 to the current date, limiting each request to one month of data for one fuel type
+            for fuel in FUEL_TYPES: 
+                params = {
+                    **base_params,
+                    "facets[fueltype][]": fuel,
+                    "start": f"{start}T00",
+                    "end": f"{end}T23",
+                }
+                records = get_data(ROUTE, params)
+                if records:
+                    load_staging(records, batch_id)
+                    conn.commit() #keep progress after each chunk
+                total += len(records)
+                print(f"{start:%Y-%m} {fuel}: {len(records)} records")
 
-        load_staging(records, batch_id)
+        print(f"Fetched {total} records")
         cur.execute(MERGE_SQL, batch_id)
         conn.commit()
         print(f"Loaded batch {batch_id}")
